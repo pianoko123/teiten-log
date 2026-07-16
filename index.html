@@ -1,0 +1,1283 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>定点log</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; padding: 0; background: #FAFAF7; }
+</style>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+
+// ---------- helpers ----------
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+const fmtDate = (s) => {
+  const d = new Date(s + "T00:00:00");
+  return `${d.getMonth() + 1}/${d.getDate()}(${"日月火水木金土"[d.getDay()]})`;
+};
+const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
+const addDays = (dateStr, n) => {
+  const d = new Date(dateStr + "T00:00:00");
+  d.setDate(d.getDate() + n);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+const bedtimeToDecimal = (hhmm) => {
+  if (!hhmm) return null;
+  const [h, m] = hhmm.split(":").map(Number);
+  const hour = h < 12 ? h + 24 : h;
+  return hour + m / 60;
+};
+
+// ---------- shared definitions ----------
+const EVAL = {
+  good: { label: "うまくいった", color: "#2F6F4E" },
+  bad: { label: "うまくいかなかった", color: "#B4402A" },
+  neutral: { label: "ふつう", color: "#6B7280" },
+};
+const ISSUE_STATUS = {
+  open: { label: "未着手", color: "#9CA3AF", bg: "#F3F4F6" },
+  doing: { label: "対応中", color: "#B8860B", bg: "#FBF3DD" },
+  done: { label: "解決", color: "#2F6F4E", bg: "#E9F5EE" },
+};
+// static colors per domain; the "study" LABEL is overridden at runtime by study.goalName
+// wherever it's shown, since that slot is meant to be reusable for a future goal.
+const DOMAIN_COLOR = { work: "#14324D", study: "#B8860B", daily: "#7C5CB0" };
+const DOMAIN_STATIC_LABEL = { work: "仕事", study: "簿記", daily: "日常" };
+const goalLabel = (study) => (study?.goalName || "").trim() || "簿記";
+const domainLabelOf = (domain, study) => (domain === "study" ? goalLabel(study) : DOMAIN_STATIC_LABEL[domain]);
+
+const COMPETENCY = [
+  { layer: "土台", key: "time", label: "時間管理", desc: "始業に間に合う行動ができているか" },
+  { layer: "土台", key: "attendance", label: "勤怠", desc: "連絡・手続きに漏れがないか" },
+  { layer: "土台", key: "report", label: "報連相", desc: "必要な情報を必要なタイミングで伝えられているか" },
+  { layer: "実務スキル", key: "purpose", label: "目的合致行動", desc: "作業前に目的を確認できているか" },
+  { layer: "実務スキル", key: "multitask", label: "マルチタスク", desc: "複数業務を同時に破綻なく回せているか" },
+  { layer: "実務スキル", key: "design", label: "タスク設計", desc: "着手前に手順・優先度を組み立てられているか" },
+  { layer: "印象・信頼", key: "comm", label: "コミュニケーションの質", desc: "言葉遣い・テンションが場に合っているか" },
+  { layer: "印象・信頼", key: "care", label: "対人配慮", desc: "気配り・距離感が適切か" },
+  { layer: "印象・信頼", key: "owner", label: "当事者意識", desc: "他責にせず、人を悪く言わずに対応できているか" },
+];
+const LAYERS = ["土台", "実務スキル", "印象・信頼"];
+const LAYER_COLOR = { 土台: "#14324D", 実務スキル: "#B8860B", "印象・信頼": "#2F6F4E" };
+const SCALE_LABELS = ["できていない", "時々できている", "半々", "だいたいできている", "安定してできている"];
+
+const DEFAULT_CHAPTERS = [
+  "簿記の基礎（仕訳の仕組み）", "商品売買", "現金・預金", "手形・電子記録債権", "有形固定資産", "決算整理・精算表",
+].map((title) => ({ id: genId(), title, status: "todo", completedAt: null }));
+const MILESTONE_STATUS = {
+  todo: { label: "未着手", color: "#9CA3AF", bg: "#F3F4F6" },
+  doing: { label: "進行中", color: "#B8860B", bg: "#FBF3DD" },
+  done: { label: "完了", color: "#2F6F4E", bg: "#E9F5EE" },
+};
+
+// ---------- storage (Netlify Blobs via serverless function — shared across all devices/browsers) ----------
+const storage = {
+  get: async (key) => {
+    try {
+      const res = await fetch(`/api/data?key=${encodeURIComponent(key)}`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.value !== null && data.value !== undefined ? { key, value: data.value } : null;
+    } catch (e) { return null; }
+  },
+  set: async (key, value) => {
+    try {
+      const res = await fetch(`/api/data?key=${encodeURIComponent(key)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ value }),
+      });
+      if (!res.ok) return null;
+      return { key, value };
+    } catch (e) { return null; }
+  },
+  delete: async (key) => {
+    try {
+      const res = await fetch(`/api/data?key=${encodeURIComponent(key)}`, { method: "DELETE" });
+      if (!res.ok) return null;
+      return { key, deleted: true };
+    } catch (e) { return null; }
+  },
+};
+
+// ---------- storage ----------
+async function loadAll() {
+  const out = { records: [], lifeDaily: [], comp: [], study: { goalName: "簿記", examDate: "", chapters: DEFAULT_CHAPTERS }, issues: [] };
+  const keys = [
+    ["records-data", "records"], ["life-daily-data", "lifeDaily"], ["comp-data", "comp"],
+    ["study-data", "study"], ["issues-data", "issues"],
+  ];
+  for (const [storageKey, field] of keys) {
+    try {
+      const r = await storage.get(storageKey);
+      if (r?.value) out[field] = JSON.parse(r.value);
+    } catch (e) {}
+  }
+  if (!out.study.goalName) out.study.goalName = "簿記";
+  return out;
+}
+const saveRecords = (v) => storage.set("records-data", JSON.stringify(v)).catch(console.error);
+const saveLifeDaily = (v) => storage.set("life-daily-data", JSON.stringify(v)).catch(console.error);
+const saveComp = (v) => storage.set("comp-data", JSON.stringify(v)).catch(console.error);
+const saveStudy = (v) => storage.set("study-data", JSON.stringify(v)).catch(console.error);
+const saveIssues = (v) => storage.set("issues-data", JSON.stringify(v)).catch(console.error);
+
+// ---------- shared small UI ----------
+function Card({ children }) { return <div style={{ background: "#fff", border: "1px solid #E4E1D8", borderRadius: 14, padding: 16 }}>{children}</div>; }
+function FieldLabel({ children }) { return <div style={{ fontSize: 11.5, fontWeight: 700, color: "#6B7280", marginBottom: 6, marginTop: 12 }}>{children}</div>; }
+function SectionTitle({ children, noMargin }) { return <div style={{ fontSize: 12.5, fontWeight: 700, color: "#14324D", marginBottom: noMargin ? 0 : 10, letterSpacing: 0.2 }}>{children}</div>; }
+function Stat({ label, value, color = "#14324D" }) {
+  return (
+    <div style={{ background: "#FAFAF7", borderRadius: 10, padding: "10px 12px" }}>
+      <div style={{ fontSize: 20, fontWeight: 700, color, fontFamily: "ui-monospace, monospace" }}>{value}</div>
+      <div style={{ fontSize: 11, color: "#9CA3AF", marginTop: 2 }}>{label}</div>
+    </div>
+  );
+}
+function EmptyState({ text }) { return <div style={{ textAlign: "center", padding: "24px 0", color: "#B3BAC4", fontSize: 12.5 }}>{text}</div>; }
+function DeleteRow({ onDelete, label }) {
+  const [confirming, setConfirming] = useState(false);
+  if (confirming) {
+    return (
+      <div style={{ marginTop: 10, fontSize: 11.5, color: "#B4402A", display: "flex", alignItems: "center", gap: 8 }}>
+        本当に削除しますか？
+        <button onClick={onDelete} style={{ color: "#B4402A", background: "none", border: "none", padding: 0, cursor: "pointer", fontWeight: 700, textDecoration: "underline" }}>削除する</button>
+        <button onClick={() => setConfirming(false)} style={{ color: "#9CA3AF", background: "none", border: "none", padding: 0, cursor: "pointer" }}>やめる</button>
+      </div>
+    );
+  }
+  return (
+    <button onClick={() => setConfirming(true)} style={{ marginTop: 10, fontSize: 11.5, color: "#B4402A", background: "none", border: "none", padding: 0, cursor: "pointer" }}>{label}</button>
+  );
+}
+function DayStamp({ n, tone }) {
+  return (
+    <div style={{ width: 44, height: 44, borderRadius: "50%", border: `1.5px solid ${tone}`, color: tone, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", transform: "rotate(-6deg)", flexShrink: 0, fontFamily: "'JetBrains Mono', ui-monospace, monospace", lineHeight: 1 }}>
+      <span style={{ fontSize: 13, fontWeight: 700 }}>{n}</span>
+      <span style={{ fontSize: 7, letterSpacing: 0.5 }}>DAYS</span>
+    </div>
+  );
+}
+function IconChevron({ dir = "right", size = 16, color = "#14324D", style }) {
+  const d = dir === "left" ? "M10 3L5 8L10 13" : "M6 3L11 8L6 13";
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" style={style}>
+      <path d={d} fill="none" stroke={color} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+function IconPlus({ size = 16, color = "#14324D" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16">
+      <path d="M8 2V14M2 8H14" stroke={color} strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
+function IconX({ size = 16, color = "#14324D" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16">
+      <path d="M3 3L13 13M13 3L3 13" stroke={color} strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+// small dependency-free line chart (replaces recharts) — one or more series over the same x-axis
+function MiniLineChart({ data, xKey, series, height = 160, yMin, yMax, yFormat }) {
+  const padL = 34, padR = 8, padT = 10, padB = 20;
+  const width = 320;
+  const values = data.flatMap((d) => series.map((s) => d[s.key]).filter((v) => v !== null && v !== undefined));
+  const lo = yMin !== undefined ? yMin : Math.min(...values, 0);
+  const hi = yMax !== undefined ? yMax : Math.max(...values, 1);
+  const span = hi - lo || 1;
+  const n = data.length;
+  const x = (i) => padL + (n > 1 ? (i / (n - 1)) * (width - padL - padR) : 0);
+  const y = (v) => padT + (1 - (v - lo) / span) * (height - padT - padB);
+
+  return (
+    <div style={{ background: "#fff", border: "1px solid #E4E1D8", borderRadius: 12, padding: "10px 8px 4px" }}>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 4, paddingLeft: padL }}>
+        {series.map((s) => (
+          <div key={s.key} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 10.5, color: "#6B7280" }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: s.color, display: "inline-block" }} />
+            {s.label || s.key}
+          </div>
+        ))}
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} width="100%" height={height} preserveAspectRatio="none">
+        <line x1={padL} y1={padT} x2={padL} y2={height - padB} stroke="#E4E1D8" />
+        <line x1={padL} y1={height - padB} x2={width - padR} y2={height - padB} stroke="#E4E1D8" />
+        <text x={2} y={y(hi) + 4} fontSize="9" fill="#9CA3AF">{yFormat ? yFormat(hi) : Math.round(hi)}</text>
+        <text x={2} y={y(lo) + 4} fontSize="9" fill="#9CA3AF">{yFormat ? yFormat(lo) : Math.round(lo)}</text>
+        {series.map((s) => {
+          const pts = data.map((d, i) => (d[s.key] !== null && d[s.key] !== undefined ? [x(i), y(d[s.key])] : null));
+          const segments = [];
+          let cur = [];
+          pts.forEach((p) => { if (p) cur.push(p); else { if (cur.length > 1) segments.push(cur); cur = []; } });
+          if (cur.length > 1) segments.push(cur);
+          return (
+            <g key={s.key}>
+              {segments.map((seg, si) => (
+                <polyline key={si} points={seg.map((p) => p.join(",")).join(" ")} fill="none" stroke={s.color} strokeWidth="2" />
+              ))}
+              {pts.map((p, i) => p && <circle key={i} cx={p[0]} cy={p[1]} r="2.5" fill={s.color} />)}
+            </g>
+          );
+        })}
+        {data.map((d, i) => (i === 0 || i === n - 1 || n <= 7) && (
+          <text key={i} x={x(i)} y={height - 6} fontSize="8.5" fill="#9CA3AF" textAnchor="middle">{d[xKey]}</text>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+function DateNav({ date, setDate }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+      <button onClick={() => setDate(addDays(date, -1))} style={navBtn}><IconChevron dir="left" /></button>
+      <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 12.5, color: "#6B7280" }}>{fmtDate(date)}</span>
+      <button onClick={() => setDate(addDays(date, 1))} style={navBtn}><IconChevron dir="right" /></button>
+    </div>
+  );
+}
+function TagPicker({ domain, issues, selected, onToggle, onCreate }) {
+  const [draft, setDraft] = useState("");
+  const domainTags = issues.filter((t) => t.domain === domain);
+  const color = DOMAIN_COLOR[domain];
+  return (
+    <div>
+      {domainTags.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+          {domainTags.map((t) => {
+            const isOn = selected.includes(t.id);
+            return (
+              <button key={t.id} onClick={() => onToggle(t.id)} style={{
+                fontSize: 11.5, padding: "5px 10px", borderRadius: 14,
+                border: `1px solid ${isOn ? color : "#E4E1D8"}`,
+                background: isOn ? color : "#fff", color: isOn ? "#fff" : "#6B7280", fontWeight: 600, cursor: "pointer",
+              }}>#{t.title}</button>
+            );
+          })}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 6 }}>
+        <input type="text" value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="＋ 新しいタグ"
+          style={{ ...inputStyle, flex: 1, marginBottom: 0 }}
+          onKeyDown={(e) => { if (e.key === "Enter" && draft.trim()) { onCreate(draft.trim()); setDraft(""); } }} />
+        <button onClick={() => { if (draft.trim()) { onCreate(draft.trim()); setDraft(""); } }} style={{ padding: "0 12px", borderRadius: 8, border: "1px solid #E4E1D8", background: "#fff", cursor: "pointer" }}>
+          <IconPlus color={color} size={14} />
+        </button>
+      </div>
+    </div>
+  );
+}
+const navBtn = { width: 32, height: 32, borderRadius: 8, border: "1px solid #E4E1D8", background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" };
+const inputStyle = { width: "100%", padding: "9px 10px", borderRadius: 8, border: "1px solid #E4E1D8", fontSize: 16, color: "#14324D", marginBottom: 4, background: "#fff", WebkitAppearance: "none" };
+const taStyle = { ...inputStyle, resize: "vertical", fontFamily: "inherit" };
+
+// ---------- reusable: uniform event-report form + today's list (same shape for all domains) ----------
+function EventForm({ domain, date, records, setRecords, issues, getOrCreateTag, flash, placeholder }) {
+  const [event, setEvent] = useState("");
+  const [cause, setCause] = useState("");
+  const [learning, setLearning] = useState("");
+  const [evalVal, setEvalVal] = useState("neutral");
+  const [nextAction, setNextAction] = useState("");
+  const [tagIds, setTagIds] = useState([]);
+  const draftLoaded = useRef(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await storage.get(`draft-${domain}`);
+        if (r?.value) {
+          const d = JSON.parse(r.value);
+          setEvent(d.event || ""); setCause(d.cause || ""); setLearning(d.learning || ""); setEvalVal(d.evalVal || "neutral");
+          setNextAction(d.nextAction || ""); setTagIds(d.tagIds || []);
+        }
+      } catch (e) {}
+      draftLoaded.current = true;
+    })();
+    // eslint-disable-next-line
+  }, []);
+
+  useEffect(() => {
+    if (!draftLoaded.current) return;
+    const timer = setTimeout(() => {
+      storage.set(`draft-${domain}`, JSON.stringify({ event, cause, learning, evalVal, nextAction, tagIds })).catch(() => {});
+    }, 350);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line
+  }, [event, cause, learning, evalVal, nextAction, tagIds]);
+
+  const canSave = event.trim().length > 0;
+  const toggleTag = (id) => setTagIds((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+  const createTag = async (title) => { const id = await getOrCreateTag(domain, title); if (id) setTagIds((prev) => [...prev, id]); };
+
+  const add = async () => {
+    if (!canSave) return;
+    const rec = { id: genId(), domain, date, event: event.trim(), cause: cause.trim(), learning: learning.trim(), evaluation: evalVal, nextAction: nextAction.trim(), tagIds, createdAt: Date.now() };
+    const next = [rec, ...records];
+    setRecords(next);
+    await saveRecords(next);
+    setEvent(""); setCause(""); setLearning(""); setEvalVal("neutral"); setNextAction(""); setTagIds([]);
+    storage.delete(`draft-${domain}`).catch(() => {});
+    flash("記録しました");
+  };
+
+  const persistDraft = () => storage.set(`draft-${domain}`, JSON.stringify({ event, cause, learning, evalVal, nextAction, tagIds })).catch(() => {});
+
+  return (
+    <Card>
+      <FieldLabel>何があったか</FieldLabel>
+      <textarea value={event} onChange={(e) => setEvent(e.target.value)} onBlur={persistDraft} rows={2} placeholder={placeholder?.event} style={taStyle} />
+      <FieldLabel>なぜそうなったか</FieldLabel>
+      <textarea value={cause} onChange={(e) => setCause(e.target.value)} onBlur={persistDraft} rows={2} placeholder={placeholder?.cause} style={taStyle} />
+      <FieldLabel>学び</FieldLabel>
+      <textarea value={learning} onChange={(e) => setLearning(e.target.value)} onBlur={persistDraft} rows={2} placeholder={placeholder?.learning} style={taStyle} />
+      <FieldLabel>次どうするか</FieldLabel>
+      <textarea value={nextAction} onChange={(e) => setNextAction(e.target.value)} onBlur={persistDraft} rows={2} style={taStyle} />
+      <FieldLabel>タグ</FieldLabel>
+      <TagPicker domain={domain} issues={issues} selected={tagIds} onToggle={toggleTag} onCreate={createTag} />
+      <FieldLabel>評価</FieldLabel>
+      <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
+        {Object.entries(EVAL).map(([k, v]) => (
+          <button key={k} onClick={() => setEvalVal(k)} style={{
+            flex: 1, padding: "8px 0", borderRadius: 8, border: `1.5px solid ${evalVal === k ? v.color : "#E4E1D8"}`,
+            background: evalVal === k ? v.color + "15" : "#fff", color: evalVal === k ? v.color : "#9CA3AF", fontSize: 12, fontWeight: 600, cursor: "pointer",
+          }}>{v.label}</button>
+        ))}
+      </div>
+      <button onClick={add} disabled={!canSave} style={{
+        width: "100%", marginTop: 10, padding: "11px 0", borderRadius: 10, border: "none",
+        background: canSave ? "#14324D" : "#D8DCE1", color: "#fff", fontWeight: 700, fontSize: 13.5, cursor: canSave ? "pointer" : "default",
+      }}>
+        この出来事を記録に追加
+      </button>
+      {(event || cause || learning || nextAction) && <div style={{ fontSize: 10, color: "#B3BAC4", marginTop: 6, textAlign: "center" }}>下書きは自動保存されています</div>}
+    </Card>
+  );
+}
+
+function EventList({ domain, date, records, setRecords, issues, getOrCreateTag }) {
+  const [expanded, setExpanded] = useState(null);
+  const [editingId, setEditingId] = useState(null);
+  const [editFields, setEditFields] = useState({ event: "", cause: "", learning: "", evaluation: "neutral", nextAction: "", tagIds: [] });
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  const items = records.filter((r) => r.domain === domain && r.date === date);
+  const tagTitle = (id) => issues.find((i) => i.id === id)?.title;
+
+  const del = async (id) => {
+    const next = records.filter((r) => r.id !== id);
+    setRecords(next);
+    await saveRecords(next);
+    setConfirmDeleteId(null);
+    if (editingId === id) setEditingId(null);
+  };
+  const startEdit = (l) => {
+    setEditingId(l.id);
+    setEditFields({ event: l.event, cause: l.cause, learning: l.learning || "", evaluation: l.evaluation, nextAction: l.nextAction, tagIds: l.tagIds || [] });
+    setExpanded(l.id);
+  };
+  const cancelEdit = () => { setEditingId(null); setConfirmDeleteId(null); };
+  const saveEdit = async (id) => {
+    const next = records.map((r) => r.id === id ? {
+      ...r, event: editFields.event.trim(), cause: editFields.cause.trim(), learning: editFields.learning.trim(),
+      evaluation: editFields.evaluation, nextAction: editFields.nextAction.trim(), tagIds: editFields.tagIds,
+    } : r);
+    setRecords(next);
+    await saveRecords(next);
+    setEditingId(null);
+  };
+  const toggleEditTag = (id) => setEditFields((f) => ({ ...f, tagIds: f.tagIds.includes(id) ? f.tagIds.filter((x) => x !== id) : [...f.tagIds, id] }));
+  const createEditTag = async (title) => { const id = await getOrCreateTag(domain, title); if (id) setEditFields((f) => ({ ...f, tagIds: [...f.tagIds, id] })); };
+
+  if (items.length === 0) return null;
+  return (
+    <div style={{ marginTop: 10 }}>
+      {items.map((l) => {
+        const isOpen = expanded === l.id;
+        const isEditing = editingId === l.id;
+        return (
+          <div key={l.id} style={{ background: "#fff", border: "1px solid #E4E1D8", borderRadius: 10, padding: "10px 12px", marginBottom: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }} onClick={() => !isEditing && setExpanded(isOpen ? null : l.id)}>
+              <span style={{ fontSize: 13, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{l.event}</span>
+              {!isEditing && <IconChevron dir="right" color="#B3BAC4" style={{ transform: isOpen ? "rotate(90deg)" : "none", transition: "transform .15s", flexShrink: 0 }} />}
+            </div>
+            {!isEditing && (l.tagIds || []).length > 0 && (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
+                {l.tagIds.map((id) => tagTitle(id) && <span key={id} style={{ fontSize: 10.5, color: DOMAIN_COLOR[domain], background: "#F3F1FB", borderRadius: 10, padding: "2px 8px" }}>#{tagTitle(id)}</span>)}
+              </div>
+            )}
+            {isOpen && !isEditing && (
+              <div style={{ marginTop: 8, fontSize: 12.5, color: "#4A5568", lineHeight: 1.6 }}>
+                {l.cause && <div><b style={{ color: "#14324D" }}>原因：</b>{l.cause}</div>}
+                {l.learning && <div style={{ marginTop: 2 }}><b style={{ color: "#14324D" }}>学び：</b>{l.learning}</div>}
+                {l.nextAction && <div style={{ marginTop: 2 }}><b style={{ color: "#14324D" }}>次のアクション：</b>{l.nextAction}</div>}
+                <div style={{ marginTop: 2 }}><span style={{ color: EVAL[l.evaluation]?.color, fontWeight: 600 }}>{EVAL[l.evaluation]?.label}</span></div>
+                <div style={{ display: "flex", gap: 12, marginTop: 8 }}>
+                  <button onClick={() => startEdit(l)} style={{ fontSize: 11, color: "#14324D", background: "none", border: "none", padding: 0, cursor: "pointer", fontWeight: 600 }}>編集する</button>
+                  {confirmDeleteId === l.id ? (
+                    <span style={{ fontSize: 11, color: "#B4402A" }}>
+                      本当に削除しますか？
+                      <button onClick={() => del(l.id)} style={{ marginLeft: 6, fontSize: 11, color: "#B4402A", background: "none", border: "none", padding: 0, cursor: "pointer", fontWeight: 700, textDecoration: "underline" }}>削除する</button>
+                      <button onClick={() => setConfirmDeleteId(null)} style={{ marginLeft: 6, fontSize: 11, color: "#9CA3AF", background: "none", border: "none", padding: 0, cursor: "pointer" }}>やめる</button>
+                    </span>
+                  ) : (
+                    <button onClick={() => setConfirmDeleteId(l.id)} style={{ fontSize: 11, color: "#B4402A", background: "none", border: "none", padding: 0, cursor: "pointer" }}>削除する</button>
+                  )}
+                </div>
+              </div>
+            )}
+            {isEditing && (
+              <div style={{ marginTop: 8 }}>
+                <FieldLabel>何があったか</FieldLabel>
+                <textarea value={editFields.event} onChange={(e) => setEditFields((f) => ({ ...f, event: e.target.value }))} rows={2} style={taStyle} />
+                <FieldLabel>なぜそうなったか</FieldLabel>
+                <textarea value={editFields.cause} onChange={(e) => setEditFields((f) => ({ ...f, cause: e.target.value }))} rows={2} style={taStyle} />
+                <FieldLabel>学び</FieldLabel>
+                <textarea value={editFields.learning} onChange={(e) => setEditFields((f) => ({ ...f, learning: e.target.value }))} rows={2} style={taStyle} />
+                <FieldLabel>次どうするか</FieldLabel>
+                <textarea value={editFields.nextAction} onChange={(e) => setEditFields((f) => ({ ...f, nextAction: e.target.value }))} rows={2} style={taStyle} />
+                <FieldLabel>タグ</FieldLabel>
+                <TagPicker domain={domain} issues={issues} selected={editFields.tagIds} onToggle={toggleEditTag} onCreate={createEditTag} />
+                <FieldLabel>評価</FieldLabel>
+                <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
+                  {Object.entries(EVAL).map(([k, v]) => (
+                    <button key={k} onClick={() => setEditFields((f) => ({ ...f, evaluation: k }))} style={{
+                      flex: 1, padding: "7px 0", borderRadius: 8, border: `1.5px solid ${editFields.evaluation === k ? v.color : "#E4E1D8"}`,
+                      background: editFields.evaluation === k ? v.color + "15" : "#fff", color: editFields.evaluation === k ? v.color : "#9CA3AF", fontSize: 11.5, fontWeight: 600, cursor: "pointer",
+                    }}>{v.label}</button>
+                  ))}
+                </div>
+                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                  <button onClick={cancelEdit} style={{ flex: 1, padding: "9px 0", borderRadius: 10, border: "1px solid #E4E1D8", background: "#fff", color: "#9CA3AF", fontWeight: 600, fontSize: 12.5, cursor: "pointer" }}>キャンセル</button>
+                  <button onClick={() => saveEdit(l.id)} style={{ flex: 2, padding: "9px 0", borderRadius: 10, border: "none", background: "#14324D", color: "#fff", fontWeight: 700, fontSize: 12.5, cursor: "pointer" }}>保存する</button>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------- main ----------
+function App() {
+  const [loading, setLoading] = useState(true);
+  const [records, setRecords] = useState([]);
+  const [lifeDaily, setLifeDaily] = useState([]);
+  const [comp, setComp] = useState([]);
+  const [study, setStudy] = useState({ goalName: "簿記", examDate: "", chapters: DEFAULT_CHAPTERS });
+  const [issues, setIssues] = useState([]);
+  const [tab, setTab] = useState("daily");
+  const [toast, setToast] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      const d = await loadAll();
+      setRecords(d.records); setLifeDaily(d.lifeDaily); setComp(d.comp); setStudy(d.study); setIssues(d.issues);
+      setLoading(false);
+    })();
+  }, []);
+
+  const flash = (msg) => { setToast(msg); setTimeout(() => setToast(""), 1500); };
+
+  const getOrCreateTag = async (domain, title) => {
+    const trimmed = title.trim();
+    if (!trimmed) return null;
+    const existing = issues.find((i) => i.domain === domain && i.title.trim().toLowerCase() === trimmed.toLowerCase());
+    if (existing) return existing.id;
+    const tag = { id: genId(), domain, title: trimmed, status: "open", firstDate: todayStr(), resolvedDate: null };
+    const next = [tag, ...issues];
+    setIssues(next);
+    await saveIssues(next);
+    return tag.id;
+  };
+
+  if (loading) {
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#FAFAF7" }}>
+        <span style={{ fontFamily: "ui-monospace, monospace", color: "#9CA3AF", fontSize: 13 }}>loading…</span>
+      </div>
+    );
+  }
+
+  const tabs = [
+    ["daily", "日常"],
+    ["study", goalLabel(study)],
+    ["work", "仕事"],
+    ["issues", "課題"],
+    ["review", "振り返り"],
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#FAFAF7", fontFamily: "'Inter', system-ui, sans-serif", color: "#14324D", paddingBottom: "calc(90px + env(safe-area-inset-bottom))" }}>
+      <style>{`
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        html, body { overscroll-behavior-y: none; }
+        textarea, input, select { font-family: inherit; }
+        input, textarea, select, button { font-size: 16px; }
+        ::placeholder { color: #B3BAC4; }
+        .app-shell { max-width: 480px; }
+        @media (min-width: 700px) {
+          .app-shell { max-width: 640px; }
+        }
+        @media (min-width: 1024px) {
+          .app-shell { max-width: 760px; }
+        }
+      `}</style>
+
+      <div className="app-shell" style={{ margin: "0 auto", padding: "calc(20px + env(safe-area-inset-top)) 16px 12px" }}>
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
+          <h1 style={{ margin: 0, fontSize: 19, fontWeight: 700, letterSpacing: -0.3 }}>定点log</h1>
+          <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 12, color: "#9CA3AF" }}>{fmtDate(todayStr())}</span>
+        </div>
+        <div style={{ height: 1, background: "#E4E1D8", marginTop: 12 }} />
+      </div>
+
+      {/* all tabs stay mounted (hidden via CSS) so switching tabs never discards in-progress input */}
+      <div className="app-shell" style={{ margin: "0 auto", padding: "0 16px" }}>
+        <div style={{ display: tab === "daily" ? "block" : "none" }}>
+          <DailyTab lifeDaily={lifeDaily} setLifeDaily={setLifeDaily} records={records} setRecords={setRecords} issues={issues} getOrCreateTag={getOrCreateTag} flash={flash} />
+        </div>
+        <div style={{ display: tab === "study" ? "block" : "none" }}>
+          <StudyTab study={study} setStudy={setStudy} records={records} setRecords={setRecords} issues={issues} getOrCreateTag={getOrCreateTag} flash={flash} />
+        </div>
+        <div style={{ display: tab === "work" ? "block" : "none" }}>
+          <WorkTab comp={comp} setComp={setComp} records={records} setRecords={setRecords} issues={issues} getOrCreateTag={getOrCreateTag} flash={flash} />
+        </div>
+        <div style={{ display: tab === "issues" ? "block" : "none" }}>
+          <IssuesTab issues={issues} setIssues={setIssues} getOrCreateTag={getOrCreateTag} records={records} study={study} flash={flash} />
+        </div>
+        <div style={{ display: tab === "review" ? "block" : "none" }}>
+          <ReviewTab records={records} lifeDaily={lifeDaily} comp={comp} study={study} issues={issues} />
+        </div>
+      </div>
+
+      <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, background: "#fff", borderTop: "1px solid #E4E1D8", display: "flex", justifyContent: "center", paddingBottom: "env(safe-area-inset-bottom)" }}>
+        <div className="app-shell" style={{ width: "100%", display: "flex" }}>
+          {tabs.map(([id, label]) => (
+            <button key={id} onClick={() => setTab(id)} style={{
+              flex: 1, padding: "13px 4px 11px", background: "none", border: "none",
+              borderTop: tab === id ? "2px solid #14324D" : "2px solid transparent",
+              color: tab === id ? "#14324D" : "#9CA3AF", fontWeight: tab === id ? 700 : 500, fontSize: 11,
+              cursor: "pointer", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+            }}>{label}</button>
+          ))}
+        </div>
+      </div>
+
+      {toast && (
+        <div style={{ position: "fixed", bottom: "calc(78px + env(safe-area-inset-bottom))", left: "50%", transform: "translateX(-50%)", background: "#14324D", color: "#fff", padding: "8px 16px", borderRadius: 20, fontSize: 13, boxShadow: "0 4px 12px rgba(0,0,0,0.15)" }}>
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- 日常 TAB ----------
+function DailyTab({ lifeDaily, setLifeDaily, records, setRecords, issues, getOrCreateTag, flash }) {
+  const [date, setDate] = useState(todayStr());
+  const existingLife = lifeDaily.find((d) => d.date === date);
+  const [bedtime, setBedtime] = useState(existingLife?.bedtime || "");
+  const [wakeTime, setWakeTime] = useState(existingLife?.wakeTime || "");
+  const [late, setLate] = useState(!!existingLife?.late);
+  const skipFirst = useRef(true);
+
+  useEffect(() => {
+    const e = lifeDaily.find((d) => d.date === date);
+    setBedtime(e?.bedtime || ""); setWakeTime(e?.wakeTime || ""); setLate(!!e?.late);
+    skipFirst.current = true;
+    // eslint-disable-next-line
+  }, [date]);
+
+  useEffect(() => {
+    if (skipFirst.current) { skipFirst.current = false; return; }
+    const timer = setTimeout(async () => {
+      const cur = lifeDaily.find((d) => d.date === date);
+      const entry = { date, bedtime, wakeTime, late, studyMinutes: cur?.studyMinutes || 0 };
+      const next = cur ? lifeDaily.map((d) => (d.date === date ? entry : d)) : [entry, ...lifeDaily];
+      next.sort((a, b) => (a.date < b.date ? 1 : -1));
+      setLifeDaily(next);
+      await saveLifeDaily(next);
+    }, 500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line
+  }, [bedtime, wakeTime, late]);
+
+  return (
+    <div style={{ paddingTop: 4 }}>
+      <DateNav date={date} setDate={setDate} />
+      <div style={{ fontSize: 10.5, color: "#B3BAC4", textAlign: "center", marginBottom: 14 }}>入力内容は自動保存されます</div>
+
+      <SectionTitle>生活リズム</SectionTitle>
+      <Card>
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <FieldLabel>就寝（前夜）</FieldLabel>
+            <input type="time" value={bedtime} onChange={(e) => setBedtime(e.target.value)} style={inputStyle} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <FieldLabel>起床</FieldLabel>
+            <input type="time" value={wakeTime} onChange={(e) => setWakeTime(e.target.value)} style={inputStyle} />
+          </div>
+        </div>
+        <FieldLabel>遅刻</FieldLabel>
+        <div style={{ display: "flex", gap: 8 }}>
+          {[["なし", false], ["あり", true]].map(([label, v]) => (
+            <button key={label} onClick={() => setLate(v)} style={{
+              flex: 1, padding: "8px 0", borderRadius: 8,
+              border: `1.5px solid ${late === v ? (v ? "#B4402A" : "#2F6F4E") : "#E4E1D8"}`,
+              background: late === v ? (v ? "#B4402A15" : "#2F6F4E15") : "#fff",
+              color: late === v ? (v ? "#B4402A" : "#2F6F4E") : "#9CA3AF", fontSize: 12, fontWeight: 600, cursor: "pointer",
+            }}>{label}</button>
+          ))}
+        </div>
+        {existingLife && (
+          <DeleteRow onDelete={async () => {
+            const next = lifeDaily.filter((d) => d.date !== date);
+            setLifeDaily(next);
+            await saveLifeDaily(next);
+            setBedtime(""); setWakeTime(""); setLate(false);
+          }} label="この日の生活リズムを削除" />
+        )}
+      </Card>
+
+      <div style={{ marginTop: 20 }}>
+        <SectionTitle>出来事</SectionTitle>
+        <EventForm domain="daily" date={date} records={records} setRecords={setRecords} issues={issues} getOrCreateTag={getOrCreateTag} flash={flash} placeholder={{ event: "例：夜更かしして朝また遅刻しそうになった", cause: "例：寝る前にスマホを見続けた" }} />
+        <EventList domain="daily" date={date} records={records} setRecords={setRecords} issues={issues} getOrCreateTag={getOrCreateTag} />
+      </div>
+    </div>
+  );
+}
+
+// ---------- 簿記／目標 TAB (renameable) ----------
+function StudyTab({ study, setStudy, records, setRecords, issues, getOrCreateTag, flash }) {
+  const [date, setDate] = useState(todayStr());
+  const [goalName, setGoalName] = useState(study.goalName || "簿記");
+  const [examDate, setExamDate] = useState(study.examDate || "");
+  const [newChapter, setNewChapter] = useState("");
+  const chapters = study.chapters || [];
+  const skipFirst = useRef(true);
+
+  useEffect(() => { setGoalName(study.goalName || "簿記"); setExamDate(study.examDate || ""); }, [study.goalName, study.examDate]);
+
+  const persist = async (next) => { setStudy(next); await saveStudy(next); };
+
+  useEffect(() => {
+    if (skipFirst.current) { skipFirst.current = false; return; }
+    const timer = setTimeout(() => persist({ ...study, goalName, examDate, chapters }), 500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line
+  }, [goalName, examDate]);
+
+  const setChapterStatus = (id, status) => persist({ ...study, goalName, examDate, chapters: chapters.map((c) => c.id === id ? { ...c, status, completedAt: status === "done" ? todayStr() : null } : c) });
+  const addChapter = () => {
+    if (!newChapter.trim()) return;
+    persist({ ...study, goalName, examDate, chapters: [...chapters, { id: genId(), title: newChapter.trim(), status: "todo", completedAt: null }] });
+    setNewChapter("");
+  };
+  const removeChapter = (id) => persist({ ...study, goalName, examDate, chapters: chapters.filter((c) => c.id !== id) });
+  const clearMilestones = () => {
+    if (window.confirm && !window.confirm(`「${goalName}」のマイルストーンを全て削除しますか？（新しい目標に切り替えるときに使います）`)) return;
+    persist({ ...study, goalName, examDate, chapters: [] });
+  };
+
+  return (
+    <div style={{ paddingTop: 4 }}>
+      <DateNav date={date} setDate={setDate} />
+      <div style={{ fontSize: 10.5, color: "#B3BAC4", textAlign: "center", marginBottom: 14 }}>入力内容は自動保存されます</div>
+
+      <Card>
+        <FieldLabel>目標名（達成したら書き換えてOK）</FieldLabel>
+        <input type="text" value={goalName} onChange={(e) => setGoalName(e.target.value)} placeholder="例：簿記、英語資格、次の目標" style={inputStyle} />
+        <FieldLabel>達成期限</FieldLabel>
+        <input type="date" value={examDate} onChange={(e) => setExamDate(e.target.value)} style={inputStyle} />
+      </Card>
+
+      <div style={{ marginTop: 16, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <SectionTitle noMargin>マイルストーン</SectionTitle>
+        {chapters.length > 0 && (
+          <button onClick={clearMilestones} style={{ fontSize: 10.5, color: "#B4402A", background: "none", border: "none", cursor: "pointer" }}>全て削除</button>
+        )}
+      </div>
+      <div style={{ marginTop: 10 }}>
+        {chapters.map((c) => {
+          const s = MILESTONE_STATUS[c.status];
+          return (
+            <div key={c.id} style={{ background: "#fff", border: "1px solid #E4E1D8", borderRadius: 10, padding: "10px 12px", marginBottom: 6 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                <span style={{ fontSize: 13, lineHeight: 1.4 }}>{c.title}</span>
+                <button onClick={() => removeChapter(c.id)} style={{ background: "none", border: "none", cursor: "pointer", padding: 0, flexShrink: 0 }}><IconX color="#D1D5DB" size={14} /></button>
+              </div>
+              <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                {Object.entries(MILESTONE_STATUS).map(([k, v]) => (
+                  <button key={k} onClick={() => setChapterStatus(c.id, k)} style={{
+                    fontSize: 11, padding: "5px 10px", borderRadius: 6, border: `1px solid ${c.status === k ? v.color : "#E4E1D8"}`,
+                    background: c.status === k ? v.bg : "#fff", color: c.status === k ? v.color : "#9CA3AF", fontWeight: 600, cursor: "pointer",
+                  }}>{v.label}</button>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          <input type="text" value={newChapter} onChange={(e) => setNewChapter(e.target.value)} placeholder="項目を追加" style={{ ...inputStyle, flex: 1, marginBottom: 0 }} />
+          <button onClick={addChapter} style={{ padding: "0 12px", borderRadius: 8, border: "1px solid #E4E1D8", background: "#fff", cursor: "pointer" }}><IconPlus color="#14324D" size={16} /></button>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 20 }}>
+        <SectionTitle>出来事</SectionTitle>
+        <EventForm domain="study" date={date} records={records} setRecords={setRecords} issues={issues} getOrCreateTag={getOrCreateTag} flash={flash} placeholder={{ event: "例：計画通り進まなかった", cause: "例：理解があいまいなまま先に進んでいた" }} />
+        <EventList domain="study" date={date} records={records} setRecords={setRecords} issues={issues} getOrCreateTag={getOrCreateTag} />
+      </div>
+    </div>
+  );
+}
+
+// ---------- 仕事 TAB (evaluation + record, same page) ----------
+function WorkTab({ comp, setComp, records, setRecords, issues, getOrCreateTag, flash }) {
+  const [date, setDate] = useState(todayStr());
+  const existingComp = comp.find((c) => c.date === date);
+  const [scores, setScores] = useState(existingComp?.scores || {});
+  const [compNote, setCompNote] = useState(existingComp?.note || "");
+  const skipFirstNote = useRef(true);
+
+  useEffect(() => {
+    const e = comp.find((c) => c.date === date);
+    setScores(e?.scores || {}); setCompNote(e?.note || "");
+    skipFirstNote.current = true;
+    // eslint-disable-next-line
+  }, [date]);
+
+  const setScore = async (key, v) => {
+    const nextScores = { ...scores, [key]: v };
+    setScores(nextScores);
+    const cur = comp.find((c) => c.date === date);
+    const entry = { date, scores: nextScores, note: cur?.note ?? compNote };
+    const next = cur ? comp.map((c) => (c.date === date ? entry : c)) : [entry, ...comp];
+    setComp(next);
+    await saveComp(next);
+  };
+
+  useEffect(() => {
+    if (skipFirstNote.current) { skipFirstNote.current = false; return; }
+    const timer = setTimeout(async () => {
+      const cur = comp.find((c) => c.date === date);
+      const entry = { date, scores: cur?.scores || scores, note: compNote };
+      const next = cur ? comp.map((c) => (c.date === date ? entry : c)) : [entry, ...comp];
+      setComp(next);
+      await saveComp(next);
+    }, 500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line
+  }, [compNote]);
+
+  const tagLowScore = async (item) => {
+    const id = await getOrCreateTag("daily", item.label);
+    if (id) flash(`#${item.label} タグを作成しました。関連する出来事に付けてください`);
+  };
+
+  return (
+    <div style={{ paddingTop: 4 }}>
+      <DateNav date={date} setDate={setDate} />
+      <div style={{ fontSize: 10.5, color: "#B3BAC4", textAlign: "center", marginBottom: 14 }}>入力内容は自動保存されます</div>
+
+      <SectionTitle>評価</SectionTitle>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#9CA3AF", padding: "0 2px", marginBottom: 8 }}>
+        {SCALE_LABELS.map((l, i) => <span key={i} style={{ width: 38, textAlign: "center" }}>{i + 1}</span>)}
+      </div>
+      {LAYERS.map((layer) => (
+        <div key={layer} style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, color: LAYER_COLOR[layer], marginBottom: 6 }}>{layer}</div>
+          {COMPETENCY.filter((i) => i.layer === layer).map((item) => (
+            <div key={item.key} style={{ background: "#fff", border: "1px solid #E4E1D8", borderRadius: 10, padding: "9px 12px", marginBottom: 6 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>{item.label}</div>
+              <div style={{ fontSize: 10.5, color: "#9CA3AF", marginTop: 2, marginBottom: 6 }}>{item.desc}</div>
+              <div style={{ display: "flex", gap: 5 }}>
+                {[1, 2, 3, 4, 5].map((n) => (
+                  <button key={n} onClick={() => setScore(item.key, n)} style={{
+                    width: 32, height: 32, borderRadius: 8, border: `1.5px solid ${scores[item.key] === n ? LAYER_COLOR[layer] : "#E4E1D8"}`,
+                    background: scores[item.key] === n ? LAYER_COLOR[layer] : "#fff", color: scores[item.key] === n ? "#fff" : "#9CA3AF",
+                    fontWeight: 700, fontSize: 12.5, cursor: "pointer",
+                  }}>{n}</button>
+                ))}
+              </div>
+              {scores[item.key] && scores[item.key] <= 3 && (
+                <button onClick={() => tagLowScore(item)} style={{ marginTop: 6, fontSize: 10.5, color: "#B4402A", background: "#FBEDE9", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer", fontWeight: 600 }}>
+                  → #{item.label} タグを作成
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      ))}
+      <FieldLabel>評価メモ（任意）</FieldLabel>
+      <textarea value={compNote} onChange={(e) => setCompNote(e.target.value)} rows={2} style={taStyle} />
+      {existingComp && (
+        <DeleteRow onDelete={async () => {
+          const next = comp.filter((c) => c.date !== date);
+          setComp(next);
+          await saveComp(next);
+          setScores({}); setCompNote("");
+        }} label="この日の評価を削除" />
+      )}
+
+      <div style={{ marginTop: 20 }}>
+        <SectionTitle>出来事</SectionTitle>
+        <EventForm domain="work" date={date} records={records} setRecords={setRecords} issues={issues} getOrCreateTag={getOrCreateTag} flash={flash} placeholder={{ event: "例：新規提案が通らなかった", cause: "例：先方の予算感を事前確認していなかった" }} />
+        <EventList domain="work" date={date} records={records} setRecords={setRecords} issues={issues} getOrCreateTag={getOrCreateTag} />
+      </div>
+    </div>
+  );
+}
+
+// ---------- ISSUES (TAGS) TAB ----------
+function IssuesTab({ issues, setIssues, getOrCreateTag, records, study, flash }) {
+  const [domainFilter, setDomainFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("open");
+  const [formOpen, setFormOpen] = useState(false);
+  const [domain, setDomain] = useState("work");
+  const [title, setTitle] = useState("");
+  const [openTimeline, setOpenTimeline] = useState(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [renamingId, setRenamingId] = useState(null);
+  const [renameText, setRenameText] = useState("");
+
+  const label = (d) => domainLabelOf(d, study);
+
+  const handleAdd = async () => {
+    if (!title.trim()) return;
+    await getOrCreateTag(domain, title);
+    flash("タグを記録しました");
+    setTitle(""); setFormOpen(false);
+  };
+  const deleteTag = async (id) => {
+    const next = issues.filter((i) => i.id !== id);
+    setIssues(next);
+    await saveIssues(next);
+    setConfirmDeleteId(null);
+    flash("タグを削除しました");
+  };
+  const startRename = (it) => { setRenamingId(it.id); setRenameText(it.title); };
+  const saveRename = async (id) => {
+    if (!renameText.trim()) return;
+    const next = issues.map((i) => i.id === id ? { ...i, title: renameText.trim() } : i);
+    setIssues(next);
+    await saveIssues(next);
+    setRenamingId(null);
+  };
+  const updateStatus = async (id, status) => {
+    const next = issues.map((it) => it.id === id ? { ...it, status, resolvedDate: status === "done" ? todayStr() : status === "open" ? null : it.resolvedDate } : it);
+    setIssues(next);
+    await saveIssues(next);
+  };
+
+  const withMeta = issues.map((it) => ({ ...it, days: daysBetween(it.firstDate, it.status === "done" ? it.resolvedDate || todayStr() : todayStr()) }));
+  const filtered = withMeta
+    .filter((it) => (domainFilter === "all" ? true : it.domain === domainFilter))
+    .filter((it) => (statusFilter === "all" ? true : statusFilter === "open" ? it.status !== "done" : it.status === "done"))
+    .sort((a, b) => b.days - a.days);
+
+  const timelineFor = (tagId) =>
+    records.filter((r) => (r.tagIds || []).includes(tagId))
+      .map((r) => ({ date: r.date, type: label(r.domain), text: r.event, sub: r.cause }))
+      .sort((a, b) => (a.date < b.date ? 1 : -1));
+
+  return (
+    <div style={{ paddingTop: 4 }}>
+      {!formOpen && (
+        <button onClick={() => setFormOpen(true)} style={{ width: "100%", padding: "11px 0", borderRadius: 10, border: "1.5px dashed #B3BAC4", background: "#fff", color: "#6B7280", fontSize: 13, fontWeight: 600, cursor: "pointer", marginBottom: 14 }}>
+          ＋ 新しいタグを作成
+        </button>
+      )}
+      {formOpen && (
+        <Card>
+          <FieldLabel>領域</FieldLabel>
+          <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
+            {["work", "study", "daily"].map((k) => (
+              <button key={k} onClick={() => setDomain(k)} style={{
+                flex: 1, padding: "8px 0", borderRadius: 8, border: `1.5px solid ${domain === k ? DOMAIN_COLOR[k] : "#E4E1D8"}`,
+                background: domain === k ? DOMAIN_COLOR[k] + "15" : "#fff", color: domain === k ? DOMAIN_COLOR[k] : "#9CA3AF", fontSize: 12, fontWeight: 600, cursor: "pointer",
+              }}>{label(k)}</button>
+            ))}
+          </div>
+          <FieldLabel>タグ名</FieldLabel>
+          <input type="text" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="例：時間管理" style={inputStyle} />
+          <div style={{ fontSize: 10.5, color: "#9CA3AF", marginTop: 4 }}>原因や対応の詳細は、各タブでこのタグを付けたときに書けます</div>
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button onClick={() => { setFormOpen(false); setTitle(""); }} style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: "1px solid #E4E1D8", background: "#fff", color: "#9CA3AF", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>キャンセル</button>
+            <button onClick={handleAdd} disabled={!title.trim()} style={{ flex: 2, padding: "10px 0", borderRadius: 10, border: "none", background: title.trim() ? "#14324D" : "#D8DCE1", color: "#fff", fontWeight: 700, fontSize: 13, cursor: title.trim() ? "pointer" : "default" }}>作成する</button>
+          </div>
+        </Card>
+      )}
+
+      <div style={{ display: "flex", gap: 6, marginTop: 14, marginBottom: 6, flexWrap: "wrap" }}>
+        {[["all", "すべての領域"], ["work", label("work")], ["study", label("study")], ["daily", label("daily")]].map(([k, l]) => (
+          <button key={k} onClick={() => setDomainFilter(k)} style={{
+            padding: "6px 12px", borderRadius: 20, border: `1px solid ${domainFilter === k ? "#14324D" : "#E4E1D8"}`,
+            background: domainFilter === k ? "#14324D" : "#fff", color: domainFilter === k ? "#fff" : "#6B7280", fontSize: 12, fontWeight: 600, cursor: "pointer",
+          }}>{l}</button>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+        {[["open", "未解決"], ["done", "解決済み"], ["all", "すべて"]].map(([k, l]) => (
+          <button key={k} onClick={() => setStatusFilter(k)} style={{
+            padding: "6px 12px", borderRadius: 20, border: `1px solid ${statusFilter === k ? "#14324D" : "#E4E1D8"}`,
+            background: statusFilter === k ? "#14324D" : "#fff", color: statusFilter === k ? "#fff" : "#6B7280", fontSize: 12, fontWeight: 600, cursor: "pointer",
+          }}>{l}</button>
+        ))}
+      </div>
+
+      {filtered.length === 0 && <EmptyState text="該当するタグがありません" />}
+
+      {filtered.map((it) => {
+        const s = ISSUE_STATUS[it.status];
+        const timeline = timelineFor(it.id);
+        const isOpen = openTimeline === it.id;
+        return (
+          <div key={it.id} style={{ background: "#fff", border: "1px solid #E4E1D8", borderRadius: 12, padding: 14, marginBottom: 10, display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <DayStamp n={it.days} tone={s.color} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <span style={{ fontSize: 10.5, fontWeight: 700, color: DOMAIN_COLOR[it.domain] }}>{label(it.domain)}</span>
+                  {renamingId === it.id ? (
+                    <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+                      <input type="text" value={renameText} onChange={(e) => setRenameText(e.target.value)} style={{ ...inputStyle, marginBottom: 0, flex: 1 }} />
+                      <button onClick={() => saveRename(it.id)} style={{ fontSize: 11, padding: "0 10px", borderRadius: 8, border: "none", background: "#14324D", color: "#fff", fontWeight: 700, cursor: "pointer" }}>保存</button>
+                      <button onClick={() => setRenamingId(null)} style={{ fontSize: 11, padding: "0 10px", borderRadius: 8, border: "1px solid #E4E1D8", background: "#fff", color: "#9CA3AF", cursor: "pointer" }}>×</button>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 14, fontWeight: 600, lineHeight: 1.4 }}>#{it.title}</div>
+                  )}
+                </div>
+                <span style={{ flexShrink: 0, fontSize: 11, fontWeight: 700, color: s.color, background: s.bg, padding: "2px 8px", borderRadius: 6 }}>{s.label}</span>
+              </div>
+              <div style={{ fontSize: 11, color: "#9CA3AF", marginTop: 4, fontFamily: "ui-monospace, monospace" }}>初出 {fmtDate(it.firstDate)}</div>
+              <button onClick={() => setOpenTimeline(isOpen ? null : it.id)} style={{ marginTop: 8, fontSize: 11.5, color: "#14324D", background: "none", border: "none", padding: 0, cursor: "pointer", fontWeight: 600, textDecoration: "underline" }}>
+                関連する記録を見る（{timeline.length}件）
+              </button>
+              {isOpen && (
+                <div style={{ marginTop: 8 }}>
+                  {timeline.length === 0 && <div style={{ fontSize: 11.5, color: "#9CA3AF" }}>まだこのタグの記録がありません</div>}
+                  {timeline.map((t, idx) => (
+                    <div key={idx} style={{ background: "#FAFAF7", borderRadius: 8, padding: "6px 10px", marginBottom: 4, fontSize: 11.5 }}>
+                      <span style={{ fontFamily: "ui-monospace, monospace", color: "#9CA3AF" }}>{fmtDate(t.date)}</span>
+                      <span style={{ marginLeft: 6, color: "#9CA3AF" }}>[{t.type}]</span>
+                      <div style={{ marginTop: 2, color: "#4A5568" }}>{t.text}</div>
+                      {t.sub && <div style={{ color: "#9CA3AF", marginTop: 1 }}>{t.sub}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap", alignItems: "center" }}>
+                {Object.entries(ISSUE_STATUS).map(([k, v]) => (
+                  <button key={k} onClick={() => updateStatus(it.id, k)} style={{
+                    fontSize: 11, padding: "5px 10px", borderRadius: 6, border: `1px solid ${it.status === k ? v.color : "#E4E1D8"}`,
+                    background: it.status === k ? v.bg : "#fff", color: it.status === k ? v.color : "#9CA3AF", fontWeight: 600, cursor: "pointer",
+                  }}>{v.label}</button>
+                ))}
+                {renamingId !== it.id && (
+                  <button onClick={() => startRename(it)} style={{ fontSize: 11, padding: "5px 10px", borderRadius: 6, border: "1px solid #E4E1D8", background: "#fff", color: "#6B7280", cursor: "pointer" }}>名前変更</button>
+                )}
+                {confirmDeleteId === it.id ? (
+                  <span style={{ fontSize: 11, color: "#B4402A", display: "flex", alignItems: "center", gap: 6 }}>
+                    削除しますか？
+                    <button onClick={() => deleteTag(it.id)} style={{ fontSize: 11, color: "#B4402A", background: "none", border: "none", padding: 0, cursor: "pointer", fontWeight: 700, textDecoration: "underline" }}>削除する</button>
+                    <button onClick={() => setConfirmDeleteId(null)} style={{ fontSize: 11, color: "#9CA3AF", background: "none", border: "none", padding: 0, cursor: "pointer" }}>やめる</button>
+                  </span>
+                ) : (
+                  <button onClick={() => setConfirmDeleteId(it.id)} style={{ fontSize: 11, padding: "5px 10px", borderRadius: 6, border: "1px solid #E4E1D8", background: "#fff", color: "#B4402A", cursor: "pointer" }}>削除</button>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------- REVIEW TAB ----------
+function ReviewTab({ records, lifeDaily, comp, study, issues }) {
+  const [range, setRange] = useState("month");
+  const [domainFilter, setDomainFilter] = useState("all");
+  const [evalFilter, setEvalFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [openDates, setOpenDates] = useState(() => new Set());
+  const label = (d) => domainLabelOf(d, study);
+
+  const cutoff = useMemo(() => {
+    const d = new Date();
+    if (range === "week") d.setDate(d.getDate() - 7);
+    else if (range === "month") d.setMonth(d.getMonth() - 1);
+    else if (range === "2months") d.setMonth(d.getMonth() - 2);
+    else return null;
+    return d.toISOString().slice(0, 10);
+  }, [range]);
+
+  const lifeInRange = cutoff ? lifeDaily.filter((d) => d.date >= cutoff) : lifeDaily;
+  const recordsInRange = cutoff ? records.filter((r) => r.date >= cutoff) : records;
+  const workRecords = recordsInRange.filter((r) => r.domain === "work");
+  const lateCount = lifeInRange.filter((d) => d.late).length;
+  const avgStudy = lifeInRange.length ? Math.round(lifeInRange.reduce((s, d) => s + (Number(d.studyMinutes) || 0), 0) / lifeInRange.length) : 0;
+  const goodCount = workRecords.filter((l) => l.evaluation === "good").length;
+  const badCount = workRecords.filter((l) => l.evaluation === "bad").length;
+  const openWork = issues.filter((i) => i.domain === "work" && i.status !== "done").length;
+  const openStudy = issues.filter((i) => i.domain === "study" && i.status !== "done").length;
+  const openDaily = issues.filter((i) => i.domain === "daily" && i.status !== "done").length;
+
+  const chartData = [...lifeInRange].sort((a, b) => (a.date < b.date ? -1 : 1)).map((d) => ({
+    date: d.date.slice(5), 就寝: bedtimeToDecimal(d.bedtime), 学習分: Number(d.studyMinutes) || 0,
+  }));
+
+  const compTrend = useMemo(() => {
+    return [...comp].sort((a, b) => (a.date < b.date ? -1 : 1)).slice(-14).map((c) => {
+      const row = { day: c.date.slice(5) };
+      LAYERS.forEach((l) => {
+        const items = COMPETENCY.filter((i) => i.layer === l);
+        const vals = items.map((i) => c.scores[i.key]).filter((v) => v);
+        row[l] = vals.length ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 10) / 10 : null;
+      });
+      return row;
+    });
+  }, [comp]);
+
+  const chapters = study.chapters || [];
+  const doneCount = chapters.filter((c) => c.status === "done").length;
+  const remaining = chapters.length - doneCount;
+  const daysLeft = study.examDate ? daysBetween(todayStr(), study.examDate) : null;
+  const firstLogDate = lifeDaily.length ? [...lifeDaily].sort((a, b) => (a.date < b.date ? -1 : 1))[0].date : null;
+  const elapsedDays = firstLogDate ? Math.max(daysBetween(firstLogDate, todayStr()), 1) : null;
+  const avgDaysPerItem = elapsedDays && doneCount > 0 ? Math.round((elapsedDays / doneCount) * 10) / 10 : null;
+  const requiredDaysPerItem = daysLeft && daysLeft > 0 && remaining > 0 ? Math.round((daysLeft / remaining) * 10) / 10 : null;
+
+  const q = search.trim().toLowerCase();
+  const filteredRecords = recordsInRange
+    .filter((r) => (domainFilter === "all" ? true : r.domain === domainFilter))
+    .filter((r) => (evalFilter === "all" ? true : r.evaluation === evalFilter))
+    .filter((r) => (q ? (r.event + r.cause + (r.learning || "") + r.nextAction).toLowerCase().includes(q) : true));
+
+  const groups = useMemo(() => {
+    const map = {};
+    filteredRecords.forEach((r) => { (map[r.date] = map[r.date] || []).push(r); });
+    return Object.entries(map).sort((a, b) => (a[0] < b[0] ? 1 : -1));
+  }, [filteredRecords]);
+
+  const toggleDate = (date) => {
+    setOpenDates((prev) => {
+      const next = new Set(prev);
+      next.has(date) ? next.delete(date) : next.add(date);
+      return next;
+    });
+  };
+  const tagTitle = (id) => issues.find((i) => i.id === id)?.title;
+
+  return (
+    <div style={{ paddingTop: 4 }}>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+        {[["week", "今週"], ["month", "過去1ヶ月"], ["2months", "過去2ヶ月"], ["all", "全期間"]].map(([k, l]) => (
+          <button key={k} onClick={() => setRange(k)} style={{
+            padding: "6px 12px", borderRadius: 20, border: `1px solid ${range === k ? "#14324D" : "#E4E1D8"}`,
+            background: range === k ? "#14324D" : "#fff", color: range === k ? "#fff" : "#6B7280", fontSize: 12, fontWeight: 600, cursor: "pointer",
+          }}>{l}</button>
+        ))}
+      </div>
+
+      <Card>
+        <SectionTitle noMargin>サマリー</SectionTitle>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 }}>
+          <Stat label="遅刻回数" value={lateCount} color={lateCount > 0 ? "#B4402A" : "#2F6F4E"} />
+          <Stat label="平均学習時間/日" value={`${avgStudy}分`} />
+          <Stat label="うまくいった（仕事）" value={goodCount} color="#2F6F4E" />
+          <Stat label="うまくいかなかった（仕事）" value={badCount} color="#B4402A" />
+          <Stat label="未解決タグ（仕事）" value={openWork} />
+          <Stat label={`未解決タグ（${label("study")}）`} value={openStudy} />
+          <Stat label="未解決タグ（日常）" value={openDaily} />
+        </div>
+      </Card>
+
+      {compTrend.length > 1 && (
+        <div style={{ marginTop: 16 }}>
+          <SectionTitle>仕事の評価：層ごとの推移（直近14日）</SectionTitle>
+          <div style={{ background: "#fff", border: "1px solid #E4E1D8", borderRadius: 12, padding: "12px 8px 4px" }}>
+            <MiniLineChart data={compTrend} xKey="day" height={170} yMin={0} yMax={5}
+              series={LAYERS.map((l) => ({ key: l, color: LAYER_COLOR[l], label: l }))} />
+          </div>
+        </div>
+      )}
+
+      {chartData.length > 1 && (
+        <div style={{ marginTop: 16 }}>
+          <SectionTitle>就寝時刻と学習時間の推移</SectionTitle>
+          <div style={{ fontSize: 11, color: "#9CA3AF", marginBottom: 8 }}>因果はここでは断定しません。まずグラフで関係を確認してください。</div>
+          <div style={{ background: "#fff", border: "1px solid #E4E1D8", borderRadius: 12, padding: "12px 4px 4px" }}>
+            <MiniLineChart data={chartData} xKey="date" height={130} yMin={20} yMax={30} yFormat={(v) => `${Math.round(v) % 24}時`}
+              series={[{ key: "就寝", color: "#B4402A", label: "就寝時刻" }]} />
+            <div style={{ height: 10 }} />
+            <MiniLineChart data={chartData} xKey="date" height={130}
+              series={[{ key: "学習分", color: "#2F6F4E", label: "学習時間（分）" }]} />
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginTop: 16 }}>
+        <SectionTitle>{label("study")}：達成期限までの見込み</SectionTitle>
+        <Card>
+          {!study.examDate ? (
+            <div style={{ fontSize: 12.5, color: "#9CA3AF" }}>{label("study")}タブで達成期限を設定すると見込みを表示します。</div>
+          ) : remaining === 0 ? (
+            <div style={{ fontSize: 13, color: "#2F6F4E", fontWeight: 600 }}>全項目が完了しています。</div>
+          ) : !elapsedDays || elapsedDays < 3 || doneCount === 0 ? (
+            <div style={{ fontSize: 12.5, color: "#9CA3AF" }}>記録日数・完了項目数がまだ少なく、ペースの判定には情報不足です。</div>
+          ) : (
+            <>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 8 }}>
+                <span style={{ color: "#6B7280" }}>実績ペース</span>
+                <span style={{ fontFamily: "ui-monospace, monospace", fontWeight: 700 }}>1項目あたり平均{avgDaysPerItem}日</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 10 }}>
+                <span style={{ color: "#6B7280" }}>必要ペース</span>
+                <span style={{ fontFamily: "ui-monospace, monospace", fontWeight: 700 }}>1項目あたり{requiredDaysPerItem}日以内</span>
+              </div>
+              {avgDaysPerItem <= requiredDaysPerItem ? (
+                <div style={{ fontSize: 12.5, color: "#2F6F4E", fontWeight: 600, background: "#E9F5EE", padding: "8px 10px", borderRadius: 8 }}>今のペースなら期限までに完了する見込みです</div>
+              ) : (
+                <div style={{ fontSize: 12.5, color: "#B4402A", fontWeight: 600, background: "#FBEDE9", padding: "8px 10px", borderRadius: 8 }}>今のペースだと期限に間に合わない見込みです。ペースを上げる必要があります</div>
+              )}
+            </>
+          )}
+        </Card>
+      </div>
+
+      <div style={{ marginTop: 20 }}>
+        <SectionTitle>記録一覧（{filteredRecords.length}件）</SectionTitle>
+        <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="キーワードで絞り込む" style={{ ...inputStyle, marginBottom: 8 }} />
+        <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+          {[["all", "すべての領域"], ["work", label("work")], ["study", label("study")], ["daily", label("daily")]].map(([k, l]) => (
+            <button key={k} onClick={() => setDomainFilter(k)} style={{
+              padding: "5px 10px", borderRadius: 16, border: `1px solid ${domainFilter === k ? "#14324D" : "#E4E1D8"}`,
+              background: domainFilter === k ? "#14324D" : "#fff", color: domainFilter === k ? "#fff" : "#6B7280", fontSize: 11, fontWeight: 600, cursor: "pointer",
+            }}>{l}</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+          {[["all", "すべて"], ["good", "うまくいった"], ["bad", "うまくいかなかった"], ["neutral", "ふつう"]].map(([k, l]) => (
+            <button key={k} onClick={() => setEvalFilter(k)} style={{
+              padding: "5px 10px", borderRadius: 16, border: `1px solid ${evalFilter === k ? "#14324D" : "#E4E1D8"}`,
+              background: evalFilter === k ? "#14324D" : "#fff", color: evalFilter === k ? "#fff" : "#6B7280", fontSize: 11, fontWeight: 600, cursor: "pointer",
+            }}>{l}</button>
+          ))}
+        </div>
+
+        {groups.length === 0 && <EmptyState text="該当する記録がありません" />}
+
+        {groups.map(([date, items]) => {
+          const isOpen = openDates.has(date);
+          const g = items.filter((l) => l.evaluation === "good").length;
+          const b = items.filter((l) => l.evaluation === "bad").length;
+          return (
+            <div key={date} style={{ marginBottom: 8 }}>
+              <div onClick={() => toggleDate(date)} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "#fff", border: "1px solid #E4E1D8", borderRadius: 10, padding: "10px 12px", cursor: "pointer" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontFamily: "ui-monospace, monospace", fontSize: 12, color: "#6B7280" }}>{fmtDate(date)}</span>
+                  <span style={{ fontSize: 11, color: "#9CA3AF" }}>{items.length}件</span>
+                  {g > 0 && <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#2F6F4E" }} />}
+                  {b > 0 && <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#B4402A" }} />}
+                </div>
+                <IconChevron dir="right" color="#B3BAC4" style={{ transform: isOpen ? "rotate(90deg)" : "none", transition: "transform .15s" }} />
+              </div>
+              {isOpen && (
+                <div style={{ padding: "6px 0 0 4px" }}>
+                  {items.map((l) => (
+                    <div key={l.id} style={{
+                      background: "#fff", border: "1px solid #E4E1D8", borderLeft: `3px solid ${EVAL[l.evaluation]?.color}`,
+                      borderRadius: 8, padding: "8px 12px", marginBottom: 6, fontSize: 12.5, lineHeight: 1.6,
+                    }}>
+                      <span style={{ fontSize: 10.5, fontWeight: 700, color: DOMAIN_COLOR[l.domain] }}>{label(l.domain)}</span>
+                      <div>{l.event}</div>
+                      {l.cause && <div style={{ color: "#4A5568", marginTop: 2 }}><b style={{ color: "#14324D" }}>原因：</b>{l.cause}</div>}
+                      {l.learning && <div style={{ color: "#4A5568", marginTop: 2 }}><b style={{ color: "#14324D" }}>学び：</b>{l.learning}</div>}
+                      {l.nextAction && <div style={{ color: "#4A5568", marginTop: 2 }}><b style={{ color: "#14324D" }}>次のアクション：</b>{l.nextAction}</div>}
+                      {(l.tagIds || []).length > 0 && (
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 4 }}>
+                          {l.tagIds.map((id) => tagTitle(id) && <span key={id} style={{ fontSize: 10.5, color: DOMAIN_COLOR[l.domain], background: "#F3F1FB", borderRadius: 10, padding: "2px 8px" }}>#{tagTitle(id)}</span>)}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {records.length === 0 && lifeDaily.length === 0 && <EmptyState text="まだ記録がありません" />}
+    </div>
+  );
+}
+
+
+function PasswordGate({ onUnlock }) {
+  const [input, setInput] = useState("");
+  const [error, setError] = useState(false);
+  const check = () => {
+    if (input === "opopo12345") {
+      try { localStorage.setItem("teiten-log:unlocked", "1"); } catch (e) {}
+      onUnlock();
+    } else {
+      setError(true);
+    }
+  };
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#FAFAF7", padding: 20, fontFamily: "'Inter', system-ui, sans-serif" }}>
+      <div style={{ background: "#fff", border: "1px solid #E4E1D8", borderRadius: 14, padding: 24, width: "100%", maxWidth: 320 }}>
+        <div style={{ fontSize: 16, fontWeight: 700, color: "#14324D", marginBottom: 14, textAlign: "center" }}>合言葉を入力</div>
+        <input
+          type="password" value={input} autoFocus
+          onChange={(e) => { setInput(e.target.value); setError(false); }}
+          onKeyDown={(e) => { if (e.key === "Enter") check(); }}
+          style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #E4E1D8", fontSize: 16, marginBottom: 10, boxSizing: "border-box" }}
+          placeholder="パスワード"
+        />
+        {error && <div style={{ color: "#B4402A", fontSize: 12.5, marginBottom: 10 }}>パスワードが違います</div>}
+        <button onClick={check} style={{ width: "100%", padding: "11px 0", borderRadius: 10, border: "none", background: "#14324D", color: "#fff", fontWeight: 700, fontSize: 14, cursor: "pointer" }}>
+          開く
+        </button>
+      </div>
+    </div>
+  );
+}
+function GatedApp() {
+  const [unlocked, setUnlocked] = useState(() => {
+    try { return localStorage.getItem("teiten-log:unlocked") === "1"; } catch (e) { return false; }
+  });
+  if (!unlocked) return <PasswordGate onUnlock={() => setUnlocked(true)} />;
+  return <App />;
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<GatedApp />);
+</script>
+</body>
+</html>
