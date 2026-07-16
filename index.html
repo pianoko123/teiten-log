@@ -342,13 +342,13 @@ function EventForm({ domain, date, records, setRecords, issues, getOrCreateTag, 
   return (
     <Card>
       <FieldLabel>何があったか</FieldLabel>
-      <textarea value={event} onChange={(e) => setEvent(e.target.value)} onBlur={persistDraft} rows={2} placeholder={placeholder?.event} style={taStyle} />
+      <textarea value={event} onChange={(e) => setEvent(e.target.value)} onBlur={persistDraft} rows={4} placeholder={placeholder?.event} style={taStyle} />
       <FieldLabel>なぜそうなったか</FieldLabel>
-      <textarea value={cause} onChange={(e) => setCause(e.target.value)} onBlur={persistDraft} rows={2} placeholder={placeholder?.cause} style={taStyle} />
+      <textarea value={cause} onChange={(e) => setCause(e.target.value)} onBlur={persistDraft} rows={4} placeholder={placeholder?.cause} style={taStyle} />
       <FieldLabel>学び</FieldLabel>
-      <textarea value={learning} onChange={(e) => setLearning(e.target.value)} onBlur={persistDraft} rows={2} placeholder={placeholder?.learning} style={taStyle} />
+      <textarea value={learning} onChange={(e) => setLearning(e.target.value)} onBlur={persistDraft} rows={4} placeholder={placeholder?.learning} style={taStyle} />
       <FieldLabel>次どうするか</FieldLabel>
-      <textarea value={nextAction} onChange={(e) => setNextAction(e.target.value)} onBlur={persistDraft} rows={2} style={taStyle} />
+      <textarea value={nextAction} onChange={(e) => setNextAction(e.target.value)} onBlur={persistDraft} rows={4} style={taStyle} />
       <FieldLabel>タグ</FieldLabel>
       <TagPicker domain={domain} issues={issues} selected={tagIds} onToggle={toggleTag} onCreate={createTag} />
       <FieldLabel>評価</FieldLabel>
@@ -445,13 +445,13 @@ function EventList({ domain, date, records, setRecords, issues, getOrCreateTag }
             {isEditing && (
               <div style={{ marginTop: 8 }}>
                 <FieldLabel>何があったか</FieldLabel>
-                <textarea value={editFields.event} onChange={(e) => setEditFields((f) => ({ ...f, event: e.target.value }))} rows={2} style={taStyle} />
+                <textarea value={editFields.event} onChange={(e) => setEditFields((f) => ({ ...f, event: e.target.value }))} rows={4} style={taStyle} />
                 <FieldLabel>なぜそうなったか</FieldLabel>
-                <textarea value={editFields.cause} onChange={(e) => setEditFields((f) => ({ ...f, cause: e.target.value }))} rows={2} style={taStyle} />
+                <textarea value={editFields.cause} onChange={(e) => setEditFields((f) => ({ ...f, cause: e.target.value }))} rows={4} style={taStyle} />
                 <FieldLabel>学び</FieldLabel>
-                <textarea value={editFields.learning} onChange={(e) => setEditFields((f) => ({ ...f, learning: e.target.value }))} rows={2} style={taStyle} />
+                <textarea value={editFields.learning} onChange={(e) => setEditFields((f) => ({ ...f, learning: e.target.value }))} rows={4} style={taStyle} />
                 <FieldLabel>次どうするか</FieldLabel>
-                <textarea value={editFields.nextAction} onChange={(e) => setEditFields((f) => ({ ...f, nextAction: e.target.value }))} rows={2} style={taStyle} />
+                <textarea value={editFields.nextAction} onChange={(e) => setEditFields((f) => ({ ...f, nextAction: e.target.value }))} rows={4} style={taStyle} />
                 <FieldLabel>タグ</FieldLabel>
                 <TagPicker domain={domain} issues={issues} selected={editFields.tagIds} onToggle={toggleEditTag} onCreate={createEditTag} />
                 <FieldLabel>評価</FieldLabel>
@@ -831,7 +831,7 @@ function WorkTab({ comp, setComp, records, setRecords, issues, getOrCreateTag, f
         </div>
       ))}
       <FieldLabel>評価メモ（任意）</FieldLabel>
-      <textarea value={compNote} onChange={(e) => setCompNote(e.target.value)} rows={2} style={taStyle} />
+      <textarea value={compNote} onChange={(e) => setCompNote(e.target.value)} rows={4} style={taStyle} />
       {existingComp && (
         <DeleteRow onDelete={async () => {
           const next = comp.filter((c) => c.date !== date);
